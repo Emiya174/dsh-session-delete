@@ -1,191 +1,174 @@
-/**
- * Host half of the Session delete bundle.
- *
- * The browser posts to a small authenticated exact route on Connection's
- * shared API channel. This half only deletes a stored session that is not live
- * in the current process, and only when the persistence backend reports a
- * per-session JSONL artifact whose own directory name is exactly the session
- * id. Running sessions are refused so an open append handle can never be
- * pulled out from under the Session store.
- */
+import { lstat, mkdtemp, readdir, rename, rm } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
-import { rm } from 'node:fs/promises'
-import { dirname, resolve } from 'node:path'
+export const name = 'dsh-session-delete-live'
+export const inject = ['connection', 'agents', 'sessions', 'sessionController', 'sessionPersistence']
 
-/** Plugin identity used by the loader row. */
-export const name = 'dsh-session-delete'
-
-/** Host services needed by the route. */
-export const inject = ['connection', 'sessions', 'sessionPersistence']
-
-/** Exact route owned on the shared API channel. */
 const ROUTE = '/api/session-delete'
+const EFFECT = Symbol.for('cordis.effect')
 
-/**
- * Build one wire failure.
- * @param code - stable machine-readable failure code.
- * @param message - user-facing recovery text.
- * @returns an RPC-shaped failure result.
- */
-function failure(code, message) {
-  return { ok: false, error: { code, message, details: {} } }
+function failure(code) {
+  return { ok: false, error: { code } }
 }
 
-/**
- * Serialize one result as a JSON response.
- * @param result - endpoint result.
- * @param status - HTTP status.
- * @returns JSON response.
- */
-function respond(result, status = 200) {
-  return new Response(JSON.stringify(result), {
-    status,
-    headers: { 'content-type': 'application/json; charset=utf-8' },
-  })
+function liveSession(ctx, sessionId) {
+  const session = ctx.sessions.get(sessionId)
+  if (session === undefined) return {}
+
+  const agent = ctx.agents.get(sessionId)
+  if (agent?.session !== session || session.header.origin === 'subagent') return { reason: 'session-live' }
+  if (agent.status !== 'idle') return { reason: 'session-running' }
+
+  // DSH 0.2.2-rc.5 gives the Session controller an effect per Agent that owns
+  // the real teardown. Disposing an Agent's registration scope alone would
+  // leave its writer and registry entries open. Require the exact owner and
+  // one exact effect, so an unfamiliar lifecycle is left alone.
+  const owner = ctx.fiber.committed?.sessionController?.ctx.fiber
+  const effects = owner?._disposables
+  const label = `agentLoop.lifecycle(${sessionId})`
+  const matches = effects?.[Symbol.iterator] && [...effects].filter(effect => effect[EFFECT]?.label === label)
+  if (matches?.length !== 1) return { reason: 'session-live' }
+  return { close: matches[0] }
 }
 
-/**
- * Report whether one session can be deleted without touching a live Agent.
- * @param ctx - host plugin context.
- * @param sessionId - requested Session identity.
- * @param signal - caller cancellation.
- * @returns inspect result consumed by the context menu.
- */
-async function inspectSession(ctx, sessionId, signal) {
-  const live = ctx.sessions.get(sessionId) !== undefined
-  if (live) {
-    return { deletable: false, live: true, exists: true, reason: 'session-live' }
+async function artifactDirectory(persistence, snapshot, sessionId) {
+  const { location, header } = snapshot
+  if (persistence.name !== 'session-persistence-jsonl' || location?.kind !== 'jsonl') {
+    throw new Error('unsupported-backend')
   }
-  let snapshot
-  try {
-    snapshot = await ctx.sessionPersistence.stat(sessionId, { signal })
-  } catch (error) {
-    return {
-      deletable: false,
-      live,
-      exists: false,
-      reason: error instanceof Error ? error.message : String(error),
+  const root = persistence.root
+  const directory = dirname(resolve(location.path))
+  const project = dirname(directory)
+  const storedId = basename(directory).replace(/~([\dA-F]{4})/g, (_, escape) => String.fromCharCode(parseInt(escape, 16)))
+  if (!isAbsolute(location.path) || typeof root !== 'string' || dirname(project) !== resolve(root)
+    || header.id !== sessionId || storedId !== sessionId
+    || !/^session(?:\.v[1-9]\d*)?\.jsonl(?:\.zstd)?$/.test(basename(location.path))) {
+    throw new Error('unsafe-path')
+  }
+  const [projectInfo, directoryInfo, logInfo] = await Promise.all([lstat(project), lstat(directory), lstat(location.path)])
+  if (!projectInfo.isDirectory() || !directoryInfo.isDirectory() || !logInfo.isFile()) {
+    throw new Error('unsafe-path')
+  }
+  return directory
+}
+
+async function inspect(ctx, sessionId, signal) {
+  const live = liveSession(ctx, sessionId)
+  if (live.reason) return { deletable: false, reason: live.reason }
+  if (live.close) return { deletable: true }
+  const snapshot = await ctx.sessionPersistence.stat(sessionId, { signal })
+  if (snapshot === undefined) return { deletable: false, reason: 'session-not-found' }
+  if (snapshot.location?.kind !== 'jsonl') return { deletable: false, reason: 'unsupported-backend' }
+  return { deletable: true }
+}
+
+async function removeArtifacts(directory) {
+  if (process.platform === 'win32') {
+    // Windows uses a named semaphore, so this atomic rename keeps the active
+    // lease valid. Staged logs sit one level deeper than the catalog scans.
+    const staging = await mkdtemp(join(dirname(directory), '.session-delete-'))
+    try {
+      await rename(directory, join(staging, 'artifacts'))
+    } finally {
+      await rm(staging, { recursive: true, force: true, maxRetries: 2 })
+    }
+    return
+  }
+
+  // POSIX locks the inode of session.lock. Preserve that inode so other
+  // writers cannot acquire a replacement lock while this one is held.
+  const entries = await readdir(directory)
+  for (const entry of entries) {
+    if (entry !== 'session.lock') await rm(join(directory, entry), { recursive: true, force: true })
+  }
+}
+
+async function deleteSession(ctx, sessionId, signal) {
+  const persistence = ctx.sessionPersistence
+  if (persistence.name !== 'session-persistence-jsonl') return failure('unsupported-backend')
+
+  const activity = await ctx.waterfall('workspace/session-activity', { sessionId }, async () => [])
+  if (activity.length > 0) return failure('session-running')
+
+  const before = await persistence.stat(sessionId, { signal })
+  const directory = before?.location ? await artifactDirectory(persistence, before, sessionId) : undefined
+  signal.throwIfAborted()
+  const live = liveSession(ctx, sessionId)
+  if (live.reason) return failure(live.reason)
+  if (live.close) {
+    try {
+      await live.close()
+    } catch {
+      return failure('session-close-failed')
+    }
+    if (ctx.sessions.get(sessionId) !== undefined || ctx.agents.get(sessionId) !== undefined) {
+      return failure('session-live')
     }
   }
-  if (snapshot === undefined) {
-    return { deletable: false, live, exists: false, reason: 'session-not-found' }
-  }
-  const location = snapshot.location
-  const hasArtifact = location !== undefined && location.kind === 'jsonl'
-  return {
-    deletable: !live && hasArtifact,
-    live,
-    exists: true,
-    reason: live ? 'session-live' : hasArtifact ? undefined : 'unsupported-location',
-  }
-}
 
-/**
- * Delete one stored session artifact directory.
- * @param ctx - host plugin context.
- * @param sessionId - requested Session identity.
- * @param signal - caller cancellation.
- * @returns an RPC-shaped success or failure result.
- */
-async function deleteSession(ctx, sessionId, signal) {
-  if (typeof sessionId !== 'string' || sessionId.length === 0) {
-    return failure('bad-request', 'A non-empty sessionId is required.')
-  }
-  if (ctx.sessions.get(sessionId) !== undefined) {
-    return failure(
-      'session-live',
-      'This session is open in the running DSH process. Archive it and restart DSH before deleting it.',
-    )
-  }
-  let snapshot
-  try {
-    snapshot = await ctx.sessionPersistence.stat(sessionId, { signal })
-  } catch {
-    return failure('session-not-found', 'The stored session log was not found.')
-  }
+  const snapshot = await persistence.stat(sessionId, { signal })
   if (snapshot === undefined) {
-    return failure('session-not-found', 'The stored session log was not found.')
+    return live.close && directory === undefined ? deleted(ctx, sessionId) : failure('session-not-found')
   }
-  const location = snapshot.location
-  if (location === undefined || location.kind !== 'jsonl') {
-    return failure('unsupported-backend', 'This storage backend does not expose a deletable session artifact.')
-  }
-  const sessionDirectory = dirname(resolve(location.path))
-  if (sessionDirectory === dirname(sessionDirectory)) {
-    return failure('unsafe-path', 'The stored session location is not a per-session directory.')
-  }
-  // Claim the persistence write lease before removing anything. This makes a
-  // second DSH process (or any other writer) fail the operation instead of
-  // silently losing its log. The handle is closed before the directory is
-  // removed because Windows may keep an open JSONL handle from being deleted.
+  const target = await artifactDirectory(persistence, snapshot, sessionId)
+  if (directory !== undefined && target !== directory) return failure('unsafe-path')
+
   let handle
   try {
-    handle = await ctx.sessionPersistence.open(sessionId, 'write', { signal })
+    handle = await persistence.open(sessionId, 'write', { signal })
   } catch (error) {
-    if (error instanceof Error && error.name === 'SessionAlreadyOwnedError') {
-      return failure('session-locked', 'Another DSH process is writing this session.')
-    }
-    return failure('delete-failed', 'The stored session could not be locked for deletion.')
+    if (error?.name === 'SessionAlreadyOwnedError') return failure('session-locked')
+    if (error?.name === 'SessionPersistenceNotFoundError') return failure('session-not-found')
+    throw error
   }
   try {
+    const locked = await persistence.stat(sessionId, { signal })
+    if (!locked || await artifactDirectory(persistence, locked, sessionId) !== target) return failure('unsafe-path')
+    if (ctx.sessions.get(sessionId) !== undefined) return failure('session-live')
+    signal.throwIfAborted()
+    await removeArtifacts(target)
+  } finally {
     await handle.close()
-  } catch {
-    return failure('delete-failed', 'The stored session lock could not be released.')
   }
-  try {
-    await rm(sessionDirectory, { recursive: true, force: true })
-  } catch {
-    return failure('delete-failed', 'The stored session files could not be removed.')
-  }
-  // Tell every connected Client that the Session is gone; the Session
-  // controller normally emits this on disposal, which a cold delete never
-  // reaches.
+  return deleted(ctx, sessionId)
+}
+
+function deleted(ctx, sessionId) {
   try {
     ctx.emit('api-session/removed', sessionId)
   } catch {
-    // The file removal is already durable; a missing event listener must not
-    // turn it into a failure.
+    // List refresh is still available after deletion.
   }
   return { ok: true, value: { sessionId, deleted: true } }
 }
 
-/**
- * Register the exact Session delete route.
- * @param ctx - host plugin context.
- */
 export function apply(ctx) {
-  ctx.effect(
-    () => ctx.connection.fetch.register({
-      path: ROUTE,
-      methods: ['POST'],
-      requestBody: 'buffered',
-      fetch: async (request) => {
-        let payload
-        try {
-          payload = await request.json()
-        } catch {
-          return respond(failure('bad-request', 'The request body must be JSON.'), 400)
-        }
-        if (payload === null || typeof payload !== 'object') {
-          return respond(failure('bad-request', 'The request body must be a JSON object.'), 400)
-        }
-        const sessionId = payload.sessionId
-        if (typeof sessionId !== 'string' || sessionId.length === 0) {
-          return respond(failure('bad-request', 'A non-empty sessionId is required.'), 400)
-        }
-        if (payload.action === 'inspect') {
-          try {
-            return respond({ ok: true, value: await inspectSession(ctx, sessionId, request.signal) })
-          } catch (error) {
-            return respond(failure('inspect-failed', error instanceof Error ? error.message : String(error)))
-          }
-        }
-        if (payload.action === 'delete') {
-          return respond(await deleteSession(ctx, sessionId, request.signal))
-        }
-        return respond(failure('not-found', `Unknown Session delete action "${String(payload.action)}".`), 404)
-      },
-    }),
-    'session-delete: exact API route',
-  )
+  const deleting = new Set()
+  ctx.effect(() => ctx.connection.fetch.register({
+    path: ROUTE,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    async fetch(request) {
+      const mediaType = request.headers.get('content-type')?.split(';')[0].trim().toLowerCase()
+      if (mediaType !== 'application/json') return Response.json(failure('bad-request'), { status: 415 })
+      const payload = await request.json().catch(() => null)
+      const { sessionId, action } = payload ?? {}
+      if (typeof sessionId !== 'string' || sessionId.length === 0 || (action !== 'inspect' && action !== 'delete')) {
+        return Response.json(failure('bad-request'), { status: 400 })
+      }
+      if (deleting.has(sessionId)) return Response.json(failure('delete-in-progress'))
+      if (action === 'delete') deleting.add(sessionId)
+      try {
+        const result = action === 'inspect'
+          ? { ok: true, value: await inspect(ctx, sessionId, request.signal) }
+          : await deleteSession(ctx, sessionId, request.signal)
+        return Response.json(result)
+      } catch (error) {
+        const code = ['unsafe-path', 'unsupported-backend'].includes(error?.message) ? error.message : 'delete-failed'
+        return Response.json(failure(code))
+      } finally {
+        if (action === 'delete') deleting.delete(sessionId)
+      }
+    },
+  }), 'session-delete: exact API route')
 }

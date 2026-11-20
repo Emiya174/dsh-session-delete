@@ -3,13 +3,12 @@
  *
  * Adds one structured action to the shared Session context menu and one
  * `shell.overlay` confirmation dialog. The dialog owns the destructive step:
- * it shows a pending state while the Host removes the stored session, then
- * reports success or a localized recovery message. The Host still refuses a
- * live Session because deleting an open append handle is unsafe.
+ * it shows a pending state while the Host closes an idle session and removes
+ * its stored artifacts. The dialog keeps any failure visible for retry.
  */
 
 window.__ModuleLoader__.load({
-  id: '@local/dsh-session-delete',
+  id: '@local/dsh-session-delete-live',
   factory(require) {
     const React = require('react')
     const NS = 'sessionDelete'
@@ -23,9 +22,12 @@ window.__ModuleLoader__.load({
         'dialog.cancel': 'Cancel',
         'session.untitled': 'Untitled',
         'toast.deleted': 'Session deleted.',
-        'toast.deletedPending': 'Session deleted, but the list could not refresh. Reopen DSH to update the list.',
+        'toast.deletedPending': 'Session deleted. Refresh this page to update the list.',
         'toast.failed': 'Could not delete the session.',
-        'toast.live': 'This session is still open. Archive it and restart DSH before deleting it.',
+        'toast.live': 'DSH could not close this session here. Close the client or feature that owns it, then try again.',
+        'toast.running': 'This session has active work. Stop it or wait for it to finish before deleting.',
+        'toast.closingFailed': 'The session did not close cleanly. Try again after it has closed.',
+        'toast.deleteInProgress': 'Deletion is already in progress for this session.',
         'toast.retained': 'This session is open in a view. Switch to another session before deleting it.',
         'toast.locked': 'Another DSH process is writing this session. Close it before deleting this session.',
         'toast.notFound': 'The session log was not found.',
@@ -40,9 +42,12 @@ window.__ModuleLoader__.load({
         'dialog.cancel': '取消',
         'session.untitled': '未命名',
         'toast.deleted': '会话已删除。',
-        'toast.deletedPending': '会话已删除，但列表刷新失败，请重新打开 DSH 更新列表。',
+        'toast.deletedPending': '会话已删除，请刷新当前页面以更新列表。',
         'toast.failed': '删除会话失败。',
-        'toast.live': '该会话仍在运行中，请先归档并重启 DSH 后再删除。',
+        'toast.live': '此处无法关闭这条会话。请关闭管理它的客户端或功能，再试一次。',
+        'toast.running': '这条会话还有任务在运行。请先停止任务，或等它结束后再删除。',
+        'toast.closingFailed': '会话关闭时出错。请在会话关闭后重试。',
+        'toast.deleteInProgress': '正在删除这条会话。',
         'toast.retained': '该会话正在界面中打开，请先切换到其他会话后再删除。',
         'toast.locked': '另一个 DSH 进程正在写入该会话，请先关闭它后再删除。',
         'toast.notFound': '未找到该会话日志。',
@@ -126,8 +131,10 @@ window.__ModuleLoader__.load({
             requestStore.subscribe, requestStore.get, requestStore.get,
           )
           const [busy, setBusy] = React.useState(false)
+          const [failure, setFailure] = React.useState(null)
           const cancelRef = React.useRef(null)
           React.useEffect(() => {
+            setFailure(null)
             if (request !== null) cancelRef.current?.focus()
           }, [request])
           React.useEffect(() => {
@@ -146,11 +153,15 @@ window.__ModuleLoader__.load({
           const confirm = async () => {
             if (busy) return
             setBusy(true)
+            setFailure(null)
             try {
-              await request.onConfirm()
+              const message = await request.onConfirm()
+              if (message) setFailure(message)
+              else requestStore.set(null)
+            } catch {
+              setFailure(t('toast.failed'))
             } finally {
               setBusy(false)
-              requestStore.set(null)
             }
           }
           return React.createElement('div', {
@@ -165,6 +176,7 @@ window.__ModuleLoader__.load({
           },
           React.createElement('h2', { id: 'session-delete-title', style: styles.title }, t('dialog.title')),
           React.createElement('p', { style: styles.message }, t('dialog.message', { title: request.title })),
+          failure && React.createElement('p', { role: 'alert', style: styles.message }, failure),
           React.createElement('div', { style: styles.footer },
             React.createElement('button', {
               ref: cancelRef, type: 'button', style: styles.secondary, disabled: busy, onClick: close,
@@ -176,6 +188,9 @@ window.__ModuleLoader__.load({
 
         const failureKey = (reason) => {
           if (reason === 'session-live') return 'toast.live'
+          if (reason === 'session-running') return 'toast.running'
+          if (reason === 'session-close-failed') return 'toast.closingFailed'
+          if (reason === 'delete-in-progress') return 'toast.deleteInProgress'
           if (reason === 'session-locked') return 'toast.locked'
           if (reason === 'session-not-found') return 'toast.notFound'
           if (reason === 'unsupported-location' || reason === 'unsupported-backend') return 'toast.unsupported'
@@ -215,18 +230,14 @@ window.__ModuleLoader__.load({
           return key === 'toast.failed' ? t('toast.failed') : t(key)
         }
 
+        const isRetained = (sessionId) => ctx.sessions.retainInfo(sessionId).getSnapshot().referenceCount > 0
+
         /**
          * Open the confirmation dialog for one Session.
          * @param target - captured Session row identity and display title.
          */
         const requestDelete = async (target) => {
-          let retained
-          try {
-            retained = ctx.sessions.retainInfo(target.sessionId).getSnapshot()
-          } catch {
-            retained = undefined
-          }
-          if ((retained?.referenceCount ?? 0) > 0) {
+          if (isRetained(target.sessionId)) {
             ctx.contextMenus.notify(t('toast.retained'), false)
             return
           }
@@ -244,16 +255,16 @@ window.__ModuleLoader__.load({
             sessionId: target.sessionId,
             title: target.displayTitle || t('session.untitled'),
             onConfirm: async () => {
+              if (isRetained(target.sessionId)) return t('toast.retained')
               try {
                 await call('delete', target.sessionId)
               } catch (error) {
-                ctx.contextMenus.notify(messageOf(error), false)
-                return
+                return messageOf(error)
               }
               try {
                 await ctx.sessions.refresh()
               } catch {
-                // The deletion is already durable; a failed list refresh must not turn it into an error.
+                // Deletion already completed. The user can refresh the page if needed.
               }
               const listed = ctx.sessions.list.getSnapshot().ids.includes(target.sessionId)
               ctx.contextMenus.notify(listed ? t('toast.deletedPending') : t('toast.deleted'), !listed)
