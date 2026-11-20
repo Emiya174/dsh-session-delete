@@ -1,0 +1,4 @@
+# Inserts the host half of the Session delete bundle.
+- insert:
+    - id: session-delete
+      name: '@local/dsh-session-delete'

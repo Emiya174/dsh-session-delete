@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session delete",
+    "description": "Adds a Delete session action to the session context menu. Right-click a session in the sidebar and choose Delete session; confirm in the dialog. Only stored sessions that are not open in the running DSH process can be deleted, so archive a running session and restart DSH first. Deletion permanently removes the local session log and cannot be undone."
+  }
+}
