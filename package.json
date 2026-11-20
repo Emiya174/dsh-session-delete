@@ -3,6 +3,10 @@
   "version": "0.3.0",
   "private": true,
   "description": "Add a Delete session action to the DSH session context menu.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Emiya174/dsh-session-delete.git"
+  },
   "type": "module",
   "exports": {
     ".": "./index.js",
