@@ -1,31 +1,32 @@
-# Session delete
+# DSH 会话删除
 
-Adds a **Delete session** action to the DSH session context menu.
+在 DSH 的会话右键菜单中添加 **删除会话** 操作。空闲会话无需重启 DSH 即可删除。删除后，本地会话日志无法恢复。
 
-## Install
+## 安装
 
-Tested against DSH `0.2.2-rc.5`.
+此版本仅兼容 DSH `0.2.2-rc.5`，并已在该版本上测试。
 
-1. Open the DSH **Plugins** page.
-2. Choose **Add plugin** → **Install a third-party plugin**.
-3. In **Package name or address**, enter the absolute path of this directory (or of a packed `.tgz`).
-4. Choose **Install** and confirm that **Session delete** is enabled.
+1. 打开 DSH 的 **插件** 页面。
+2. 选择 **添加插件** → **安装第三方插件**。
+3. 在 **包名或地址** 中输入本项目目录或打包好的 `.tgz` 文件的绝对路径。
+4. 点击 **安装**，确认 **会话删除** 插件已启用。
 
-When upgrading from `@local/dsh-session-delete`, uninstall that bundle first. The replacement is `@local/dsh-session-delete-live`. Keep the source directory in place when installing from a local directory because DSH links to it.
+如果已安装旧版 `@local/dsh-session-delete`，请先卸载，再安装新版 `@local/dsh-session-delete-live`。从本地目录安装时，请保留该目录，因为 DSH 会链接到它。
 
-## Usage
+## 使用
 
-1. Open the sidebar and right-click a session, or use its `...` button.
-2. Choose **Delete session**.
-3. Review the confirmation dialog and choose **Delete**.
+1. 在侧栏右键点击要删除的会话，或点击该会话旁的 `…` 按钮。
+2. 选择 **删除会话**。
+3. 核对确认对话框中的会话名称，然后点击 **删除**。
 
-An idle conversation can be deleted without restarting DSH. The host closes an idle agent through its existing lifecycle cleanup, takes the JSONL write lease, and permanently removes the session artifacts while holding the lease.
+## 使用限制
 
-## Limitations
+- 如果目标会话已打开，请先切换到其他会话，并关闭所有仍在显示目标会话的视图。
+- 如果目标会话还有任务在运行，请先停止任务或等待任务结束。由其他功能管理的活跃会话，或被其他进程锁定的会话，须先由相应功能或进程释放。
+- 子代理日志和存放在外部的附件单独存储，不随会话一起删除。
 
-- Switch away from the target session and close any view displaying it before deleting.
-- Wait for active work in the target session to finish or stop it first. Live sessions owned by other features and sessions locked by another process must be released by their owners.
-- Subagent logs and externally stored attachments are separate artifacts.
-- Live deletion uses the per-agent cleanup effect in DSH `0.2.2-rc.5`. This version of the plugin declares that exact DSH version for compatibility.
+## 实现说明
 
-The host exposes an owner-only action on DSH's shared Connection API channel at `/api/session-delete`.
+主机通过 DSH `0.2.2-rc.5` 为每个代理提供的生命周期清理机制关闭空闲代理，获取 JSONL 日志的写入租约，并在持有租约期间永久删除会话文件。
+
+主机通过 DSH 的共享 Connection API 通道提供 `/api/session-delete` 操作，仅所有者可以调用。
